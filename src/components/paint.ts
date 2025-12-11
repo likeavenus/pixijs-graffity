@@ -29,9 +29,25 @@ export class GraffitiPainter extends Container {
   private isDragging = false;
   private lastPoint: Point | null = null;
   private currentPressure = 1;
-  private brushPoints: Array<{ point: Point; pressure: number; timestamp: number }> = [];
   private accumulatedPaint: RenderTexture;
-  private isMouseDown: boolean = false;
+
+  private soundCallbacks: {
+    onSprayStart?: () => void;
+    onSprayEnd?: () => void;
+    onShake?: () => void;
+  } = {};
+
+  // Оптимизации
+  private brushGraphics: Graphics;
+  private clearGraphics: Graphics;
+
+  // Для покраски при зажатой мыши
+  private paintTimer: number = 0;
+  private readonly PAINT_INTERVAL = 0.05;
+
+  // Для оптимизации рендера
+  private framesSinceLastRender: number = 0;
+  private readonly RENDER_INTERVAL = 2;
 
   constructor(renderer: IRenderer, options: GraffitiOptions = {}) {
     super();
@@ -44,20 +60,20 @@ export class GraffitiPainter extends Container {
       maxPressure: 1.5,
       minPressure: 0.3,
       sprayDensity: 0.4,
-      //   wallTexture: "https://pixijs.com/assets/bg_grass.jpg",
-      wallTexture: "assets/preload/1024px-Red_brick_wall_texture.jpeg",
-
-      graffitiTexture: "https://pixijs.com/assets/bg_rotate.jpg",
-
+      wallTexture: "/assets/preload/1024px-Red_brick_wall_texture.jpeg", // НОВЫЙ ПУТЬ
+      graffitiTexture: "/assets/preload/gr1.png", // НОВЫЙ ПУТЬ
+      outlineTexture: "/assets/preload/gr1_o.png", // НОВЫЙ ПУТЬ
       paintAlpha: 0.1,
       ...options,
     };
 
-    // Создаем текстуру для накопления краски
     this.accumulatedPaint = RenderTexture.create({
       width: this.renderer.screen.width,
       height: this.renderer.screen.height,
     });
+
+    this.brushGraphics = new Graphics();
+    this.clearGraphics = new Graphics();
 
     this.setupEventMode();
   }
@@ -65,15 +81,14 @@ export class GraffitiPainter extends Container {
   async initialize() {
     try {
       await this.loadTextures();
-      this.setupMask(); // Сначала настраиваем маску
-      this.createLayers(); // Потом создаем слои
+      this.setupMask();
+      this.createLayers();
       this.setupSprayCan();
       this.setupInteractivity();
 
       this.clearAccumulatedPaint();
       this.clearMask();
 
-      console.log("GraffitiPainter initialized successfully");
       return this;
     } catch (error) {
       console.error("Failed to initialize GraffitiPainter:", error);
@@ -81,29 +96,39 @@ export class GraffitiPainter extends Container {
     }
   }
 
+  setSoundCallbacks(callbacks: typeof this.soundCallbacks) {
+    this.soundCallbacks = callbacks;
+  }
+
   private setupEventMode() {
     this.eventMode = "static";
     this.hitArea = this.renderer.screen;
   }
 
-  //   private async loadTextures() {
-  //     await Assets.load([this.options.wallTexture, this.options.graffitiTexture]);
-  //   }
   private async loadTextures() {
-    // Загружаем все текстуры, включая спрей
-    const texturesToLoad = [this.options.wallTexture, this.options.graffitiTexture, this.options.outlineTexture];
+    const texturesToLoad = [this.options.wallTexture, this.options.graffitiTexture, this.options.outlineTexture, "/assets/preload/spray-can.png"];
 
-    // Если есть кастомная текстура спрея, добавляем её
-    const sprayCanPath = "/assets/preload/spray-can.png";
-    texturesToLoad.push(sprayCanPath);
+    try {
+      // Очищаем кэш для новых текстур
+      if (Assets.cache.has(this.options.wallTexture)) {
+        Assets.cache.delete(this.options.wallTexture);
+      }
+      if (Assets.cache.has(this.options.graffitiTexture)) {
+        Assets.cache.delete(this.options.graffitiTexture);
+      }
+      if (Assets.cache.has(this.options.outlineTexture)) {
+        Assets.cache.delete(this.options.outlineTexture);
+      }
 
-    await Assets.load(texturesToLoad);
+      await Assets.load(texturesToLoad);
+    } catch (error) {
+      console.error("Failed to load textures:", error);
+      // Продолжаем работу даже если текстуры не загрузились
+    }
   }
 
   private setupMask() {
     const { width, height } = this.renderer.screen;
-
-    // Создаем маску ДО создания слоев
     this.maskTexture = RenderTexture.create({ width, height });
     this.maskSprite = new Sprite(this.maskTexture);
   }
@@ -111,83 +136,72 @@ export class GraffitiPainter extends Container {
   private createLayers() {
     const { width, height } = this.renderer.screen;
 
-    // Фоновый слой - стена
-    this.wallSprite = Sprite.from(this.options.wallTexture);
+    // Фоновый слой - стена (принудительно обновляем текстуру)
+    try {
+      // Явно создаем текстуру и спрайт
+      const wallTexture = Texture.from(this.options.wallTexture);
+      this.wallSprite = new Sprite(wallTexture);
+    } catch (error) {
+      console.warn("Failed to load wall texture, using fallback:", error);
+      this.wallSprite = new Sprite();
+      this.wallSprite.width = width;
+      this.wallSprite.height = height;
+      this.wallSprite.tint = 0x888888; // Серый фон как запасной вариант
+    }
+
     this.wallSprite.width = width;
     this.wallSprite.height = height;
 
-    // Слой подсветки контура (полупрозрачный белый)
-    this.outlineSprite = Sprite.from(this.options.outlineTexture);
+    // Слой подсветки контура
+    try {
+      const outlineTexture = Texture.from(this.options.outlineTexture);
+      this.outlineSprite = new Sprite(outlineTexture);
+    } catch (error) {
+      console.warn("Failed to load outline texture:", error);
+      this.outlineSprite = new Sprite();
+    }
+
     this.outlineSprite.width = width;
     this.outlineSprite.height = height;
-    this.outlineSprite.alpha = 1;
+    this.outlineSprite.alpha = 0.7; // Полупрозрачный контур
     this.outlineSprite.tint = 0xffffff;
 
-    // Слой с граффити (изначально скрыт)
-    this.graffitiSprite = Sprite.from(this.options.graffitiTexture);
+    // Слой с граффити
+    try {
+      const graffitiTexture = Texture.from(this.options.graffitiTexture);
+      this.graffitiSprite = new Sprite(graffitiTexture);
+    } catch (error) {
+      console.warn("Failed to load graffiti texture:", error);
+      this.graffitiSprite = new Sprite();
+    }
+
     this.graffitiSprite.width = width;
     this.graffitiSprite.height = height;
 
-    // Применяем маску к граффити
     this.graffitiSprite.mask = this.maskSprite;
 
-    // Добавляем все спрайты в правильном порядке
     this.addChild(this.wallSprite, this.outlineSprite, this.graffitiSprite, this.maskSprite);
   }
 
   private setupSprayCan() {
     try {
-      // Пытаемся загрузить текстуру спрея
-      let canTexture;
-      try {
-        canTexture = Texture.from("/assets/preload/spray-can.png");
-        console.log("Spray can texture loaded from file");
-      } catch (error) {
-        // Если файл не найден, создаем временную текстуру
-        console.warn("Spray can image not found, using fallback graphics");
-        const canGraphics = new Graphics();
-        canGraphics.rect(-15, -40, 30, 60).fill(0x333333).rect(-10, 20, 20, 25).fill(0x666666).circle(0, -45, 8).fill(0xff0000);
-
-        canTexture = this.renderer.generateTexture(canGraphics);
-      }
-
+      const canTexture = Texture.from("/assets/preload/spray-can.png");
       this.sprayCan = new SprayCan(canTexture);
       this.sprayCan.visible = false;
       this.sprayCan.scale.set(0.5);
-
       this.sprayCan.zIndex = 1000;
       this.addChild(this.sprayCan);
-
-      console.log("SprayCan setup completed");
     } catch (error) {
       console.error("Failed to setup spray can:", error);
+      // Fallback
+      const graphics = new Graphics();
+      graphics.rect(-20, -50, 40, 100).fill(0xff0000);
+      const texture = this.renderer.generateTexture(graphics);
+      this.sprayCan = new SprayCan(texture);
+      this.sprayCan.visible = false;
+      this.addChild(this.sprayCan);
     }
   }
-  //   private setupSprayCan() {
-  //     // Временно создадим простую текстуру баллончика через Graphics
-  //     const canGraphics = new Graphics();
-
-  //     // Рисуем простой баллончик (силуэт)
-  //     canGraphics
-  //       .rect(-15, -40, 30, 60) // Основная часть
-  //       .fill(0x333333)
-  //       .rect(-10, 20, 20, 25) // Нижняя часть
-  //       .fill(0x666666)
-  //       .circle(0, -45, 8) // Кнопка распыления
-  //       .fill(0xff0000);
-
-  //     // Конвертируем Graphics в текстуру
-  //     const canTexture = this.renderer.generateTexture(canGraphics);
-
-  //     this.sprayCan = new SprayCan(canTexture);
-  //     this.sprayCan.visible = false;
-
-  //     // Убедимся что баллончик поверх всего
-  //     this.sprayCan.zIndex = 1000;
-  //     this.addChild(this.sprayCan);
-
-  //     console.log("SprayCan setup completed");
-  //   }
 
   private setupInteractivity() {
     this.on("pointerdown", this.handlePointerDown, this);
@@ -195,72 +209,87 @@ export class GraffitiPainter extends Container {
     this.on("pointerupoutside", this.handlePointerUp, this);
     this.on("pointermove", this.handlePointerMove, this);
 
-    // Обработка клавиш для встряхивания
     window.addEventListener("keydown", this.handleKeyDown.bind(this));
     window.addEventListener("keyup", this.handleKeyUp.bind(this));
   }
-
   private handleKeyDown(event: KeyboardEvent) {
     if (event.code === "Space") {
-      this.sprayCan.startShaking();
       event.preventDefault();
+      if (this.sprayCan) {
+        this.sprayCan.startShaking();
+        // Воспроизводим звук встряхивания
+        if (this.soundCallbacks.onShake) {
+          this.soundCallbacks.onShake();
+        }
+      }
     }
   }
 
   private handleKeyUp(event: KeyboardEvent) {
     if (event.code === "Space") {
-      this.sprayCan.stopShaking();
+      if (this.sprayCan) {
+        this.sprayCan.stopShaking();
+      }
     }
   }
 
   private handlePointerDown(event: PointerEvent) {
-    this.isMouseDown = true;
+    this.isDragging = true;
 
-    if (this.sprayCan.canPaint()) {
+    if (this.sprayCan && this.sprayCan.canPaint()) {
       this.sprayCan.startSpraying();
-      this.brushPoints = [];
-      this.lastPoint = null;
-      this.handlePointerMove(event);
+      this.lastPoint = new Point(event.global.x, event.global.y);
+
+      // Немедленно рисуем первую точку
+      this.drawBrushStamp(this.lastPoint);
+      this.requestMaskUpdate();
+
+      // Воспроизводим звук распыления
+      if (this.soundCallbacks.onSprayStart) {
+        this.soundCallbacks.onSprayStart();
+      }
     }
   }
 
   private handlePointerUp() {
-    this.isMouseDown = false;
-    this.sprayCan.stopSpraying();
+    this.isDragging = false;
+    if (this.sprayCan) {
+      this.sprayCan.stopSpraying();
+    }
     this.lastPoint = null;
-    this.brushPoints = [];
+    this.paintTimer = 0;
+
+    // Останавливаем звук распыления
+    if (this.soundCallbacks.onSprayEnd) {
+      this.soundCallbacks.onSprayEnd();
+    }
   }
 
   private handlePointerMove(event: PointerEvent) {
-    // Обновляем позицию баллончика
+    // Всегда обновляем позицию баллончика
     if (this.sprayCan) {
-      this.sprayCan.setPosition(event.global.x - 20, event.global.y + this.sprayCan.height / 2 - 20);
+      this.sprayCan.setPosition(event.global.x - 20, event.global.y + 40);
       this.sprayCan.visible = true;
     }
 
-    if (this.isMouseDown && this.sprayCan.canPaint()) {
+    if (this.isDragging && this.sprayCan && this.sprayCan.canPaint()) {
       const globalPoint = new Point(event.global.x, event.global.y);
-      this.calculatePressure(globalPoint);
 
-      if (this.lastPoint) {
-        this.drawSmoothLine(this.lastPoint, globalPoint);
-      } else {
-        this.drawBrushStamp(globalPoint);
+      if (!this.lastPoint || this.distanceBetween(this.lastPoint, globalPoint) > 2) {
+        this.calculatePressure(globalPoint);
+
+        if (this.lastPoint) {
+          this.drawSmoothLine(this.lastPoint, globalPoint);
+        }
+
+        this.lastPoint = globalPoint.clone();
+        this.requestMaskUpdate();
       }
-
-      this.lastPoint = globalPoint;
-      this.brushPoints.push({
-        point: globalPoint.clone(),
-        pressure: this.currentPressure,
-        timestamp: Date.now(),
-      });
-
-      if (this.brushPoints.length > 50) {
-        this.brushPoints.shift();
-      }
-
-      this.updateMaskFromAccumulatedPaint();
     }
+  }
+
+  private distanceBetween(pointA: Point, pointB: Point): number {
+    return Math.sqrt(Math.pow(pointB.x - pointA.x, 2) + Math.pow(pointB.y - pointA.y, 2));
   }
 
   private calculatePressure(currentPoint: Point) {
@@ -269,66 +298,76 @@ export class GraffitiPainter extends Container {
       return;
     }
 
-    const distance = Math.sqrt(Math.pow(currentPoint.x - this.lastPoint.x, 2) + Math.pow(currentPoint.y - this.lastPoint.y, 2));
-
-    const lastBrushPoint = this.brushPoints[this.brushPoints.length - 1];
-    const timeDiff = lastBrushPoint ? Date.now() - lastBrushPoint.timestamp : 16;
+    const distance = this.distanceBetween(this.lastPoint, currentPoint);
+    const timeDiff = 16;
     const speed = distance / Math.max(timeDiff, 1);
 
     let targetPressure = Math.max(this.options.minPressure, this.options.maxPressure - speed * this.options.pressureSensitivity);
 
+    if (isNaN(targetPressure)) {
+      targetPressure = 1;
+    }
+
     this.currentPressure = this.currentPressure * 0.7 + targetPressure * 0.3;
+
+    if (isNaN(this.currentPressure)) {
+      this.currentPressure = 1;
+    }
   }
 
   private drawSmoothLine(pointA: Point, pointB: Point) {
-    const distance = Math.sqrt(Math.pow(pointB.x - pointA.x, 2) + Math.pow(pointB.y - pointA.y, 2));
-
-    const steps = Math.max(5, Math.floor(distance / 2));
+    const distance = this.distanceBetween(pointA, pointB);
+    const steps = Math.max(2, Math.floor(distance / 3));
 
     for (let i = 0; i <= steps; i++) {
       const t = i / steps;
       const x = pointA.x + (pointB.x - pointA.x) * t;
       const y = pointA.y + (pointB.y - pointA.y) * t;
-
       this.drawBrushStamp(new Point(x, y), this.currentPressure);
     }
   }
 
   private drawBrushStamp(point: Point, pressure: number = this.currentPressure) {
-    if (!this.sprayCan.canPaint()) return;
+    if (!this.sprayCan || !this.sprayCan.canPaint()) return;
 
-    const brush = new Graphics();
     const canPressure = this.sprayCan.getPressure();
-    const size = this.options.brushSize * pressure * canPressure;
-    const alpha = this.options.paintAlpha * pressure * canPressure * 0.5;
 
-    this.createSprayBrush(brush, size, alpha);
-    brush.position.set(point.x, point.y);
+    if (isNaN(pressure)) pressure = 1;
+    if (isNaN(canPressure)) return;
+
+    const size = this.options.brushSize * pressure * canPressure;
+    const alpha = this.options.paintAlpha * pressure * canPressure * 0.3;
+
+    this.brushGraphics.clear();
+    this.createSprayBrush(this.brushGraphics, size, alpha);
+    this.brushGraphics.position.set(point.x, point.y);
 
     this.renderer.render({
-      container: brush,
+      container: this.brushGraphics,
       target: this.accumulatedPaint,
       clear: false,
     });
   }
 
   private createSprayBrush(graphics: Graphics, size: number, alpha: number) {
-    graphics.clear();
+    graphics.circle(0, 0, size / 2).fill({ color: 0xffffff, alpha: alpha * 0.8 });
 
-    graphics.circle(0, 0, size / 2).fill({ color: 0xffffff, alpha: alpha * 0.7 });
-
-    const pointCount = Math.floor(size * 0.3);
+    const pointCount = Math.floor(size * 0.2);
     for (let i = 0; i < pointCount; i++) {
       const angle = Math.random() * Math.PI * 2;
-      const distance = Math.random() * size * 0.4;
-      const pointSize = Math.random() * size * 0.1 + 1;
-      const pointAlpha = alpha * (0.3 + Math.random() * 0.7);
+      const distance = Math.random() * size * 0.3;
+      const pointSize = Math.random() * size * 0.08 + 1;
+      const pointAlpha = alpha * (0.4 + Math.random() * 0.6);
 
       const x = Math.cos(angle) * distance;
       const y = Math.sin(angle) * distance;
 
       graphics.circle(x, y, pointSize / 2).fill({ color: 0xffffff, alpha: pointAlpha });
     }
+  }
+
+  private requestMaskUpdate() {
+    this.framesSinceLastRender = 0;
   }
 
   private updateMaskFromAccumulatedPaint() {
@@ -344,25 +383,53 @@ export class GraffitiPainter extends Container {
   }
 
   private clearAccumulatedPaint() {
-    const clearGraphics = new Graphics();
-    clearGraphics.rect(0, 0, this.renderer.screen.width, this.renderer.screen.height).fill(0x000000);
+    this.clearGraphics.clear();
+    this.clearGraphics.rect(0, 0, this.renderer.screen.width, this.renderer.screen.height).fill(0x000000);
 
     this.renderer.render({
-      container: clearGraphics,
+      container: this.clearGraphics,
       target: this.accumulatedPaint,
       clear: true,
     });
   }
 
   private clearMask() {
-    const clearGraphics = new Graphics();
-    clearGraphics.rect(0, 0, this.renderer.screen.width, this.renderer.screen.height).fill(0x000000);
+    this.clearGraphics.clear();
+    this.clearGraphics.rect(0, 0, this.renderer.screen.width, this.renderer.screen.height).fill(0x000000);
 
     this.renderer.render({
-      container: clearGraphics,
+      container: this.clearGraphics,
       target: this.maskTexture,
       clear: true,
     });
+  }
+
+  update(delta: number) {
+    if (isNaN(delta) || delta <= 0) {
+      delta = 0.016;
+    }
+
+    if (this.sprayCan) {
+      this.sprayCan.update(delta);
+    }
+
+    // Покраска при зажатой мыши
+    if (this.isDragging && this.sprayCan && this.sprayCan.canPaint() && this.lastPoint) {
+      this.paintTimer += delta;
+      if (this.paintTimer >= this.PAINT_INTERVAL) {
+        this.paintTimer = 0;
+        this.drawBrushStamp(this.lastPoint, this.currentPressure);
+        this.requestMaskUpdate();
+      }
+      this.updateMaskFromAccumulatedPaint();
+    }
+
+    // Оптимизированное обновление маски
+    // this.framesSinceLastRender++;
+    // if (this.framesSinceLastRender >= this.RENDER_INTERVAL) {
+    //   this.updateMaskFromAccumulatedPaint();
+    //   this.framesSinceLastRender = 0;
+    // }
   }
 
   // Public API
@@ -381,11 +448,8 @@ export class GraffitiPainter extends Container {
   clear() {
     this.clearAccumulatedPaint();
     this.clearMask();
-  }
-
-  update(delta: number) {
     if (this.sprayCan) {
-      this.sprayCan.update(delta);
+      this.sprayCan.refill();
     }
   }
 

@@ -1,6 +1,5 @@
 // app/components/SprayCan.ts
 import { Container, Graphics, Sprite, Text, TextStyle, type Texture } from "pixi.js";
-import { sound } from "@pixi/sound"; // Пока закомментируем звуки
 
 export interface SprayCanState {
   pressure: number;
@@ -16,12 +15,13 @@ export class SprayCan extends Container {
   private state: SprayCanState;
 
   private readonly SHAKE_TIME = 2.0;
-  private readonly PRESSURE_DRAIN_RATE = 0.3;
-  private readonly PRESSURE_REFILL_RATE = 0.5;
+  private readonly PRESSURE_DRAIN_RATE = 0.02; // УМЕНЬШИЛ в 5 раз (было 0.15)
+  private readonly PRESSURE_REFILL_RATE = 0.8; // УМЕНЬШИЛ для баланса (было 0.8)
 
   constructor(texture: Texture) {
     super();
 
+    // Инициализируем состояние с гарантированно корректными значениями
     this.state = {
       pressure: 1.0,
       isShaking: false,
@@ -29,53 +29,53 @@ export class SprayCan extends Container {
       shakeProgress: 0,
     };
 
-    // Спрайт баллончика
     this.canSprite = new Sprite(texture);
-    this.canSprite.anchor.set(0.5, 0.5); // Изменил якорь на центр для лучшего позиционирования
-    this.canSprite.scale.set(0.3); // Увеличил масштаб
-    console.log("SprayCan created with texture:", texture);
+    this.canSprite.anchor.set(0.5, 0.35);
+    this.canSprite.scale.set(0.3);
 
-    // Индикатор давления
     this.pressureIndicator = new Graphics();
 
-    // Текст давления
     const textStyle = new TextStyle({
-      fontSize: 14,
+      fontSize: 32,
       fill: "#ffffff",
       stroke: "#000000",
       strokeThickness: 4,
     });
     this.pressureText = new Text("100%", textStyle);
     this.pressureText.anchor.set(0.5);
-    this.pressureText.position.set(0, -60); // Поднял текст выше
+    this.pressureText.position.set(0, -60);
 
     this.addChild(this.canSprite, this.pressureIndicator, this.pressureText);
     this.updatePressureIndicator();
 
-    // Сделаем видимым сразу для дебага
     this.visible = true;
   }
 
   update(delta: number) {
-    if (this.state.isSpraying && this.state.pressure > 0) {
-      this.state.pressure = Math.max(0, this.state.pressure - this.PRESSURE_DRAIN_RATE * delta);
-
-      // Закомментировал звуки пока нет файлов
-      // if (!sound.find("spray")?.isPlaying) {
-      //   sound.play("spray", { loop: true, volume: 0.3 });
-      // }
-    } else {
-      // sound.stop("spray");
+    // Гарантируем корректность delta
+    if (isNaN(delta) || delta <= 0 || !isFinite(delta)) {
+      delta = 0.016;
     }
 
-    if (this.state.isShaking) {
-      this.state.shakeProgress += delta;
-      this.canSprite.rotation = Math.sin(this.state.shakeProgress * 20) * 0.3;
-      this.state.pressure = Math.min(1, this.state.pressure + this.PRESSURE_REFILL_RATE * delta);
+    const safeDelta = Math.min(delta, 0.1);
 
-      // if (!sound.find("shake")?.isPlaying && this.state.shakeProgress < 0.1) {
-      //   sound.play("shake", { volume: 0.5 });
-      // }
+    // Расходуем краску при распылении
+    if (this.state.isSpraying && this.state.pressure > 0) {
+      const newPressure = this.state.pressure - this.PRESSURE_DRAIN_RATE * safeDelta;
+      this.state.pressure = Math.max(0, newPressure);
+
+      if (this.state.pressure <= 0) {
+        this.stopSpraying();
+      }
+    }
+
+    // Пополняем краску при встряхивании
+    if (this.state.isShaking) {
+      this.state.shakeProgress += safeDelta;
+      this.canSprite.rotation = Math.sin(this.state.shakeProgress * 20) * 0.3;
+
+      const newPressure = this.state.pressure + this.PRESSURE_REFILL_RATE * safeDelta;
+      this.state.pressure = Math.min(1, newPressure);
 
       if (this.state.shakeProgress >= this.SHAKE_TIME) {
         this.stopShaking();
@@ -88,33 +88,36 @@ export class SprayCan extends Container {
   startSpraying() {
     if (this.state.pressure > 0) {
       this.state.isSpraying = true;
-      console.log("Spraying started, pressure:", this.state.pressure);
     }
   }
 
   stopSpraying() {
     this.state.isSpraying = false;
-    // sound.stop("spray");
   }
 
   startShaking() {
     if (!this.state.isShaking) {
       this.state.isShaking = true;
       this.state.shakeProgress = 0;
-      console.log("Shaking started");
     }
   }
 
   stopShaking() {
     this.state.isShaking = false;
     this.canSprite.rotation = 0;
-    // sound.stop("shake");
   }
 
   private updatePressureIndicator() {
     this.pressureIndicator.clear();
 
-    const pressure = this.state.pressure;
+    // Гарантируем корректность давления
+    let pressure = this.state.pressure;
+    if (isNaN(pressure) || !isFinite(pressure)) {
+      pressure = 1.0;
+      this.state.pressure = 1.0;
+    }
+    pressure = Math.max(0, Math.min(1, pressure));
+
     const radius = 45;
     const startAngle = -Math.PI / 2;
     const endAngle = startAngle + Math.PI * 2 * pressure;
@@ -123,21 +126,26 @@ export class SprayCan extends Container {
     if (pressure < 0.3) color = 0xff0000;
     else if (pressure < 0.6) color = 0xffff00;
 
-    // Рисуем дугу
     this.pressureIndicator.lineStyle(4, color, 1);
     this.pressureIndicator.arc(0, 0, radius, startAngle, endAngle);
 
-    // Обновляем текст
-    this.pressureText.text = `${Math.round(pressure * 100)}%`;
+    const pressurePercent = Math.round(pressure * 100);
+    this.pressureText.text = `${pressurePercent}%`;
     this.pressureText.style.fill = color;
   }
 
   canPaint(): boolean {
-    return this.state.pressure > 0 && !this.state.isShaking;
+    const pressure = isNaN(this.state.pressure) ? 0 : this.state.pressure;
+    return pressure > 0 && !this.state.isShaking;
   }
 
   getPressure(): number {
-    return this.state.pressure;
+    const pressure = isNaN(this.state.pressure) ? 0 : this.state.pressure;
+    return Math.max(0, Math.min(1, pressure));
+  }
+
+  refill() {
+    this.state.pressure = 1.0;
   }
 
   setPosition(x: number, y: number) {
